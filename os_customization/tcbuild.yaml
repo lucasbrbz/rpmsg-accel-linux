@@ -1,0 +1,18 @@
+# Sample configuration file:
+input:
+  easy-installer:
+    local: torizon-docker-verdin-imx8mp-Tezi_7.6.1+build.38.tar
+# Sample customization: insert the hdmi overlay in the IMX6
+customization:
+  device-tree:
+    include-dirs:
+      - linux/include
+    overlays:
+      add: ["verdin-imx8mp_hmp_overlay.dts", "verdin-imx8mp_accel_overlay.dts"]
+  kernel:
+    arguments:
+      - clk_ignore_unused
+
+output:
+  easy-installer:
+    local: custom-torizon-docker-verdin-imx8mp-Tezi_7.6.1+build.38.tar

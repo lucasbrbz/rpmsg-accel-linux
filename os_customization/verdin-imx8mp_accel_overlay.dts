@@ -1,0 +1,16 @@
+/* Enable RPMSG and the RemoteProc M7 driver.
+ * Note: This overlay is working only on nonwifi modules. For more information, please
+ * check the Verdin iMX8MP Datasheet section 5.4 Wi-Fi and Bluetooth.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "toradex,verdin-imx8mp";
+};
+
+&i2c4 {
+	status = "disabled";
+};
+

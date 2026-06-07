@@ -1,0 +1,14 @@
+rpmsg_accel_linux_remote:
+  section-type: application
+  contents:
+    meta_path: examples/multicore_examples/rpmsg_accel_linux/remote
+    project-root-path: boards/${board}/multicore_examples/rpmsg_accel_linux/remote/${multicore_foldername}
+    document:
+      name: rpmsg_accel_linux_remote${core_id_suffix_name}
+      category: multicore_examples/
+      brief: 'Sends simulated MPU-6050 accelerometer data (NORMAL/IMBALANCE/ANOMALY)
+        from Cortex-M7 to Cortex-A53 Linux via RPMsg-Lite bare-metal. The M7 creates
+        an endpoint on channel rpmsg-openamp-demo-channel and streams accel_msg_t
+        structs once Linux opens /dev/rpmsg0 and sends the initial handshake byte.'
+  boards:
+    evkmimx8mp: []
