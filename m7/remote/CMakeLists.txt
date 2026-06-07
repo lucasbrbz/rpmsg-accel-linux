@@ -9,12 +9,12 @@ include(${SdkRootDirPath}/CMakeLists.txt)
 
 mcux_add_source(
     BASE_PATH ${SdkRootDirPath}
-    SOURCES examples/multicore_examples/rpmsg_accel_linux/remote/main.c
+    SOURCES examples/multicore_examples/rpmsg_accel_linux/m7/remote/main.c
 )
 
 mcux_add_include(
     BASE_PATH ${SdkRootDirPath}
-    INCLUDES examples/multicore_examples/rpmsg_accel_linux/remote
+    INCLUDES examples/multicore_examples/rpmsg_accel_linux/m7/remote
              ${board_root}/${board}/multicore_examples/rpmsg_accel_linux/remote
              ${board_root}/${board}/multicore_examples/rpmsg_accel_linux/remote/${core_id}
 )

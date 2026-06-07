@@ -27,14 +27,38 @@
 
 typedef enum { STATE_NORMAL = 0, STATE_IMBALANCE, STATE_ANOMALY } accel_state_t;
 
+/* ---- Wire protocol ---- */
+#define FRAME_MAGIC   0xA55AA55AU
+#define FRAME_VERSION 1U
+
+typedef enum { FRAME_RAW_ACCEL = 1, FRAME_FEATURES = 2, FRAME_STATUS = 3 } frame_type_t;
+
+typedef enum {
+    LABEL_UNKNOWN   = 0,
+    LABEL_NORMAL    = 1,
+    LABEL_IMBALANCE = 2,
+    LABEL_ANOMALY   = 3
+} label_t;
+
 typedef struct __attribute__((packed))
 {
-    int16_t x;
-    int16_t y;
-    int16_t z;
-    uint8_t state;   /* 0=NORMAL 1=IMBALANCE 2=ANOMALY */
-    uint8_t padding;
-} accel_msg_t;
+    uint32_t magic;        /* 0xA55AA55A — 4 bytes to avoid false sync on payload data */
+    uint8_t  version;
+    uint8_t  type;
+    uint32_t seq;
+    uint32_t timestamp_ms;
+    uint8_t  label;
+    uint8_t  flags;        /* bit0: mocked  bit1: calibrated  bit2: saturated */
+    uint16_t payload_len;
+} rpmsg_frame_header_t;
+
+typedef struct __attribute__((packed)) { int16_t x; int16_t y; int16_t z; } raw_accel_payload_t;
+
+typedef struct __attribute__((packed))
+{
+    rpmsg_frame_header_t hdr;
+    raw_accel_payload_t  payload;
+} raw_accel_frame_t;
 
 /*******************************************************************************
  * Simulation helpers
@@ -49,29 +73,28 @@ static int16_t rand_noise(int16_t amplitude)
     return (int16_t)((int16_t)(s_lfsr % (uint16_t)(2 * amplitude + 1)) - amplitude);
 }
 
-static accel_msg_t make_sample(accel_state_t state)
+static raw_accel_payload_t make_sample(accel_state_t state)
 {
-    accel_msg_t msg = {0};
-    msg.state       = (uint8_t)state;
+    raw_accel_payload_t s = {0};
     switch (state)
     {
         case STATE_NORMAL:
-            msg.x = rand_noise(80);
-            msg.y = rand_noise(80);
-            msg.z = (int16_t)(ONE_G + rand_noise(80));
+            s.x = rand_noise(80);
+            s.y = rand_noise(80);
+            s.z = (int16_t)(ONE_G + rand_noise(80));
             break;
         case STATE_IMBALANCE:
-            msg.x = (int16_t)(8192  + rand_noise(250));
-            msg.y = (int16_t)(1500  + rand_noise(250));
-            msg.z = (int16_t)(14189 + rand_noise(250));
+            s.x = (int16_t)(8192  + rand_noise(250));
+            s.y = (int16_t)(1500  + rand_noise(250));
+            s.z = (int16_t)(14189 + rand_noise(250));
             break;
         case STATE_ANOMALY:
-            msg.x = (int16_t)(20000  + rand_noise(12000));
-            msg.y = (int16_t)(-18000 + rand_noise(10000));
-            msg.z = (int16_t)(5000   + rand_noise(15000));
+            s.x = (int16_t)(20000  + rand_noise(12000));
+            s.y = (int16_t)(-18000 + rand_noise(10000));
+            s.z = (int16_t)(5000   + rand_noise(15000));
             break;
     }
-    return msg;
+    return s;
 }
 
 /*******************************************************************************
@@ -141,16 +164,29 @@ static void accel_task(void *param)
 
     uint32_t seq_idx     = 0U;
     uint32_t state_count = 0U;
+    uint32_t frame_seq   = 0U;
     PRINTF("[%s]\r\n", names[seq[seq_idx]]);
 
     while (1)
     {
-        accel_state_t state = seq[seq_idx];
-        accel_msg_t   msg   = make_sample(state);
+        accel_state_t       state = seq[seq_idx];
+        raw_accel_payload_t s     = make_sample(state);
+        raw_accel_frame_t   frame;
 
-        PRINTF("[%s] x=%6d y=%6d z=%6d\r\n", names[state], msg.x, msg.y, msg.z);
-        (void)rpmsg_lite_send(rpmsg, ept, remote_addr,
-                              (char *)&msg, sizeof(msg), RL_BLOCK);
+        frame.hdr.magic       = FRAME_MAGIC;
+        frame.hdr.version     = FRAME_VERSION;
+        frame.hdr.type        = (uint8_t)FRAME_RAW_ACCEL;
+        frame.hdr.seq         = frame_seq++;
+        frame.hdr.timestamp_ms = (uint32_t)((uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
+        frame.hdr.label       = (uint8_t)((uint8_t)state + 1U); /* maps to label_t values 1–3 */
+        frame.hdr.flags       = 0x01U;                           /* bit0: mocked */
+        frame.hdr.payload_len = (uint16_t)sizeof(raw_accel_payload_t);
+        frame.payload         = s;
+
+        PRINTF("[%s] seq=%u x=%6d y=%6d z=%6d\r\n",
+               names[state], frame.hdr.seq, s.x, s.y, s.z);
+        (void)rpmsg_lite_send(rpmsg, ept, (uint32_t)remote_addr,
+                              (char *)&frame, sizeof(frame), RL_BLOCK);
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
 

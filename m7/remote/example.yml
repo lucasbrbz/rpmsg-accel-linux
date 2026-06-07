@@ -1,7 +1,7 @@
 rpmsg_accel_linux_remote:
   section-type: application
   contents:
-    meta_path: examples/multicore_examples/rpmsg_accel_linux/remote
+    meta_path: examples/multicore_examples/rpmsg_accel_linux/m7/remote
     project-root-path: boards/${board}/multicore_examples/rpmsg_accel_linux/remote/${multicore_foldername}
     document:
       name: rpmsg_accel_linux_remote${core_id_suffix_name}
