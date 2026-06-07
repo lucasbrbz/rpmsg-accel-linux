@@ -12,6 +12,7 @@ import struct
 import sys
 import argparse
 import termios
+import time
 import tty
 
 RPMSG_DEVICE  = '/dev/ttyRPMSG0'
@@ -96,11 +97,13 @@ def main():
     # Send handshake so M7 captures our endpoint address and starts streaming.
     os.write(fd, b'\x00')
     print(f'Handshake sent. Frame size: {FRAME_SIZE} bytes. Waiting for data...\n')
-    print(f'{"seq":>8}  {"t_ms":>9}  {"label":<12}  {"x":>7}  {"y":>7}  {"z":>7}  flags')
-    print('-' * 68)
+    print(f'{"seq":>8}  {"t_ms":>9}  {"recv_ms":>14}  {"label":<12}  {"x":>7}  {"y":>7}  {"z":>7}  flags')
+    print('-' * 84)
 
     while True:
         raw, skipped = read_frame(fd)
+        recv_ms = time.monotonic() * 1000.0
+
         if skipped:
             print(f'[warn] resync: skipped {skipped} byte(s)', file=sys.stderr)
 
@@ -112,7 +115,7 @@ def main():
             continue
 
         label_str = LABELS.get(label, f'UNKNOWN({label})')
-        print(f'{seq:>8}  {ts_ms:>9}  {label_str:<12}  {x:>7}  {y:>7}  {z:>7}  {decode_flags(flags)}')
+        print(f'{seq:>8}  {ts_ms:>9}  {recv_ms:>14.3f}  {label_str:<12}  {x:>7}  {y:>7}  {z:>7}  {decode_flags(flags)}')
 
 
 if __name__ == '__main__':
