@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Train a Random Forest classifier on features_data.csv and serialize the model.
+Train a quantized TFLite MLP classifier on features_data.csv.
+Produces model.tflite (INT8 internal ops, float32 I/O) for deployment
+on iMX8MP — runs on CPU (exp-a) or NPU via VX delegate (exp-b).
 
 Usage:
-    python3 train.py [--data features_data.csv] [--out model.pkl]
+    python3 train.py [--data features_data.csv] [--out model.tflite]
 """
 
 import argparse
-import joblib
+import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+import tensorflow as tf
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
 
 FEATURE_COLS = [
@@ -19,15 +22,27 @@ FEATURE_COLS = [
     'std_x',  'std_y',  'std_z',
     'p2p_x',  'p2p_y',  'p2p_z',
 ]
-LABEL_COL = 'label'
+LABEL_COL  = 'label'
+NUM_CLASSES = 3
+EPOCHS      = 50
+BATCH_SIZE  = 16
+
+
+def build_model():
+    return tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(len(FEATURE_COLS),)),
+        tf.keras.layers.Dense(32, activation='relu'),
+        tf.keras.layers.Dense(16, activation='relu'),
+        tf.keras.layers.Dense(NUM_CLASSES, activation='softmax'),
+    ])
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train RF classifier on feature data')
+    parser = argparse.ArgumentParser(description='Train quantized TFLite MLP')
     parser.add_argument('--data', default='features_data.csv',
-                        help='Path to the features CSV (default: features_data.csv)')
-    parser.add_argument('--out', default='model.pkl',
-                        help='Output model path (default: model.pkl)')
+                        help='Features CSV produced by accel_receiver.py (default: features_data.csv)')
+    parser.add_argument('--out',  default='model.tflite',
+                        help='Output TFLite model path (default: model.tflite)')
     args = parser.parse_args()
 
     df = pd.read_csv(args.data)
@@ -36,31 +51,57 @@ def main():
     print(df[LABEL_COL].value_counts().to_string())
     print()
 
-    X = df[FEATURE_COLS]
-    y = df[LABEL_COL]
+    le = LabelEncoder()
+    X  = df[FEATURE_COLS].values.astype(np.float32)
+    y  = le.fit_transform(df[LABEL_COL])
+
+    # Save class order so inference scripts can map indices back to names
+    labels_path = args.out.replace('.tflite', '_labels.npy')
+    np.save(labels_path, le.classes_)
+    print(f'Class order: {list(le.classes_)}  (saved to {labels_path})\n')
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y)
 
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
+    model = build_model()
+    model.compile(optimizer='adam',
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    model.fit(X_train, y_train,
+              epochs=EPOCHS,
+              batch_size=BATCH_SIZE,
+              validation_split=0.1,
+              verbose=1)
 
-    y_pred = model.predict(X_test)
-    print(f'Test accuracy: {(y_pred == y_test).mean():.4f}')
-    print()
-    print('Classification report:')
-    print(classification_report(y_test, y_pred))
+    _, acc = model.evaluate(X_test, y_test, verbose=0)
+    y_pred = np.argmax(model.predict(X_test, verbose=0), axis=1)
+    print(f'\nTest accuracy: {acc:.4f}')
+    print('\nClassification report:')
+    print(classification_report(y_test, y_pred, target_names=le.classes_))
     print('Confusion matrix:')
-    print(confusion_matrix(y_test, y_pred, labels=model.classes_))
-    print()
+    cm = confusion_matrix(y_test, y_pred)
+    header = f'{"":>12}' + ''.join(f'{c:>12}' for c in le.classes_)
+    print(header)
+    for label, row in zip(le.classes_, cm):
+        print(f'{label:>12}' + ''.join(f'{v:>12}' for v in row))
 
-    print('Feature importances:')
-    for col, imp in sorted(zip(FEATURE_COLS, model.feature_importances_),
-                           key=lambda x: x[1], reverse=True):
-        print(f'  {col:<10} {imp:.4f}')
+    # Convert to INT8-quantized TFLite (required for NPU via VX delegate)
+    def representative_dataset():
+        for sample in X_train:
+            yield [sample.reshape(1, -1)]
 
-    joblib.dump(model, args.out)
-    print(f'\nModel saved to {args.out}')
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations                 = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset        = representative_dataset
+    converter.target_spec.supported_ops     = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    # Float32 I/O keeps the Python interface simple; internal ops are INT8
+    converter.inference_input_type          = tf.float32
+    converter.inference_output_type         = tf.float32
+
+    tflite_model = converter.convert()
+    with open(args.out, 'wb') as f:
+        f.write(tflite_model)
+    print(f'\nQuantized TFLite model saved to {args.out}  ({len(tflite_model):,} bytes)')
 
 
 if __name__ == '__main__':

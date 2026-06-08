@@ -1,2 +1,6 @@
+# Training data — generated, not committed
+*.csv
+
+# Legacy scikit-learn artifacts
 *.pkl
 *.joblib
