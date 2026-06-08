@@ -22,6 +22,7 @@ import time
 import tty
 
 import numpy as np
+import psutil
 import tflite_runtime.interpreter as tflite
 
 RPMSG_DEVICE  = '/dev/ttyRPMSG0'
@@ -31,11 +32,10 @@ WINDOW_SIZE   = 20
 
 MAGIC_LE = struct.pack('<I', FRAME_MAGIC)
 
-# Header layout: magic(I) version(B) type(B) seq(I) ts_ms(I) label(B) flags(B) payload_len(H)
 FRAME_HEADER_FORMAT = '<IBBIIBBH'
 FRAME_HEADER_SIZE   = struct.calcsize(FRAME_HEADER_FORMAT)   # 18 bytes
 
-RAW_ACCEL_PAYLOAD_FORMAT = '<hhh'                            # x, y, z int16_t
+RAW_ACCEL_PAYLOAD_FORMAT = '<hhh'
 RAW_ACCEL_PAYLOAD_SIZE   = struct.calcsize(RAW_ACCEL_PAYLOAD_FORMAT)  # 6 bytes
 
 FRAME_RAW_ACCEL = 1
@@ -44,7 +44,9 @@ CSV_HEADER = ['seq', 't_ms', 'recv_ms', 'label', 'prediction',
               'rms_x',  'rms_y',  'rms_z',
               'peak_x', 'peak_y', 'peak_z',
               'std_x',  'std_y',  'std_z',
-              'p2p_x',  'p2p_y',  'p2p_z']
+              'p2p_x',  'p2p_y',  'p2p_z',
+              't_feat_ms', 't_infer_ms', 't_window_ms',
+              'window_interval_ms', 'cpu_percent', 'mem_rss_kb']
 
 LABELS = {0: 'UNKNOWN', 1: 'NORMAL', 2: 'IMBALANCE', 3: 'ANOMALY'}
 
@@ -72,7 +74,6 @@ def read_exact(fd, n):
 
 
 def read_frame(fd):
-    """Scan for the 4-byte magic, read the header, then read variable-length payload."""
     skipped = 0
     window = b''
     while True:
@@ -94,7 +95,6 @@ def read_frame(fd):
 
 
 def compute_features(window):
-    """Compute RMS, peak, std dev, peak-to-peak per axis over the sample window."""
     xs = [s[0] for s in window]
     ys = [s[1] for s in window]
     zs = [s[2] for s in window]
@@ -122,7 +122,6 @@ def load_interpreter(model_path, num_threads=None):
     input_details  = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
-    # Warm-up invoke
     dummy = np.zeros((1, 12), dtype=np.float32)
     interpreter.set_tensor(input_details[0]['index'], dummy)
     interpreter.invoke()
@@ -133,9 +132,11 @@ def load_interpreter(model_path, num_threads=None):
 def predict(interpreter, input_details, output_details, le_classes, features):
     x = np.array(features, dtype=np.float32).reshape(1, -1)
     interpreter.set_tensor(input_details[0]['index'], x)
+    t0 = time.perf_counter()
     interpreter.invoke()
+    t_infer_ms = (time.perf_counter() - t0) * 1000.0
     out = interpreter.get_tensor(output_details[0]['index'])
-    return le_classes[int(np.argmax(np.squeeze(out)))]
+    return le_classes[int(np.argmax(np.squeeze(out)))], t_infer_ms
 
 
 def main():
@@ -161,6 +162,9 @@ def main():
     le_classes = np.load(args.labels, allow_pickle=True)
     print(f'Model ready (CPU). Classes: {list(le_classes)}')
 
+    proc = psutil.Process()
+    proc.cpu_percent(interval=None)   # prime the counter — first call always returns 0.0
+
     csv_path = 'features_data.csv'
     csv_file = open(csv_path, 'w', newline='')
     writer   = csv.writer(csv_file)
@@ -174,14 +178,16 @@ def main():
 
     os.write(fd, b'\x00')
     print('Handshake sent. Waiting for data...\n')
-    print(f'{"seq":>8}  {"t_ms":>9}  {"label":<12}  {"pred":<12}  {"x":>7}  {"y":>7}  {"z":>7}')
-    print('-' * 80)
+    print(f'{"seq":>8}  {"t_ms":>9}  {"label":<12}  {"pred":<12}  '
+          f'{"t_feat":>8}  {"t_infer":>8}  {"cpu%":>6}')
+    print('-' * 88)
 
-    sample_buf   = []
-    window_seq   = 0
-    window_t_ms  = 0
-    window_recv  = 0.0
-    window_label = ''
+    sample_buf    = []
+    window_seq    = 0
+    window_t_ms   = 0
+    window_recv   = 0.0
+    window_label  = ''
+    prev_win_time = None   # perf_counter at last window completion
 
     while True:
         (magic, version, ftype, seq, ts_ms, label, flags, payload_len), payload_raw, skipped = \
@@ -200,8 +206,6 @@ def main():
         x, y, z   = struct.unpack(RAW_ACCEL_PAYLOAD_FORMAT, payload_raw)
         label_str = LABELS.get(label, f'UNKNOWN({label})')
 
-        print(f'{seq:>8}  {ts_ms:>9}  {label_str:<12}  {"...":>12}  {x:>7}  {y:>7}  {z:>7}')
-
         if len(sample_buf) == 0:
             window_t_ms  = ts_ms
             window_recv  = recv_ms
@@ -210,14 +214,26 @@ def main():
         window_label = label_str
 
         if len(sample_buf) >= WINDOW_SIZE:
-            feats = compute_features(sample_buf)
+            t0_feat = time.perf_counter()
+            feats   = compute_features(sample_buf)
+            t_feat_ms = (time.perf_counter() - t0_feat) * 1000.0
+
             rms_x,  rms_y,  rms_z, \
             peak_x, peak_y, peak_z, \
             std_x,  std_y,  std_z, \
             p2p_x,  p2p_y,  p2p_z  = feats
 
-            prediction = predict(interpreter, input_details, output_details,
-                                 le_classes, list(feats))
+            prediction, t_infer_ms = predict(
+                interpreter, input_details, output_details, le_classes, list(feats))
+
+            now = time.perf_counter()
+            t_window_ms        = t_feat_ms + t_infer_ms
+            window_interval_ms = (now - prev_win_time) * 1000.0 if prev_win_time else 0.0
+            prev_win_time      = now
+
+            cpu_percent = proc.cpu_percent(interval=None)
+            mem_rss_kb  = proc.memory_info().rss // 1024
+
             match = 'OK' if prediction == window_label else 'MISMATCH'
 
             writer.writerow([window_seq, window_t_ms, f'{window_recv:.3f}',
@@ -225,11 +241,14 @@ def main():
                              f'{rms_x:.3f}',  f'{rms_y:.3f}',  f'{rms_z:.3f}',
                              f'{peak_x:.3f}', f'{peak_y:.3f}', f'{peak_z:.3f}',
                              f'{std_x:.3f}',  f'{std_y:.3f}',  f'{std_z:.3f}',
-                             f'{p2p_x:.3f}',  f'{p2p_y:.3f}',  f'{p2p_z:.3f}'])
+                             f'{p2p_x:.3f}',  f'{p2p_y:.3f}',  f'{p2p_z:.3f}',
+                             f'{t_feat_ms:.3f}', f'{t_infer_ms:.3f}', f'{t_window_ms:.3f}',
+                             f'{window_interval_ms:.3f}', f'{cpu_percent:.1f}', mem_rss_kb])
             csv_file.flush()
 
-            print(f'  >> window {window_seq}  [{window_label}] → {prediction}  [{match}]  '
-                  f'rms_x={rms_x:.1f}  p2p_x={p2p_x:.1f}')
+            print(f'  >> win {window_seq:>4}  [{window_label}] → {prediction}  [{match}]  '
+                  f'feat={t_feat_ms:.2f}ms  infer={t_infer_ms:.2f}ms  '
+                  f'cpu={cpu_percent:.1f}%  rss={mem_rss_kb}KB')
 
             sample_buf  = []
             window_seq += 1
