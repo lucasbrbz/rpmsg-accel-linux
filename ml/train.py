@@ -56,8 +56,9 @@ def main():
     y  = le.fit_transform(df[LABEL_COL])
 
     # Save class order so inference scripts can map indices back to names
-    labels_path = args.out.replace('.tflite', '_labels.npy')
-    np.save(labels_path, le.classes_)
+    labels_path = args.out.replace('.tflite', '_labels.txt')
+    with open(labels_path, 'w') as f:
+        f.write('\n'.join(le.classes_))
     print(f'Class order: {list(le.classes_)}  (saved to {labels_path})\n')
 
     X_train, X_test, y_train, y_test = train_test_split(

@@ -147,8 +147,8 @@ def main():
                         help=f'RPMsg tty device (default: {RPMSG_DEVICE})')
     parser.add_argument('--model',  default='../ml/model.tflite',
                         help='TFLite model path (default: ../ml/model.tflite)')
-    parser.add_argument('--labels', default='../ml/model_labels.npy',
-                        help='Label mapping from train.py (default: ../ml/model_labels.npy)')
+    parser.add_argument('--labels', default='../ml/model_labels.txt',
+                        help='Label mapping from train.py (default: ../ml/model_labels.txt)')
     parser.add_argument('--num_threads', type=int, default=None,
                         help='Number of CPU threads for inference')
     args = parser.parse_args()
@@ -159,7 +159,8 @@ def main():
 
     interpreter, input_details, output_details = load_interpreter(
         args.model, args.num_threads)
-    le_classes = np.load(args.labels, allow_pickle=True)
+    with open(args.labels) as f:
+        le_classes = [l.strip() for l in f if l.strip()]
     print(f'Model ready (CPU). Classes: {list(le_classes)}')
 
     proc = psutil.Process()

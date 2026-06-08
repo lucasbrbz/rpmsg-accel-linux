@@ -35,9 +35,9 @@ RUN . ${WORKDIR_PATH}/.venv/bin/activate && \
     pip install --no-cache-dir tflite-runtime psutil
 
 COPY ml/model.tflite     ml/model.tflite
-COPY ml/model_labels.npy ml/model_labels.npy
+COPY ml/model_labels.txt ml/model_labels.txt
 COPY a53/accel_receiver.py .
 
 ENTRYPOINT ["/app/.venv/bin/python3", "accel_receiver.py", \
             "--model",  "ml/model.tflite", \
-            "--labels", "ml/model_labels.npy"]
+            "--labels", "ml/model_labels.txt"]
