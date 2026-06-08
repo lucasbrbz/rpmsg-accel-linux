@@ -65,8 +65,8 @@ def main():
                         help='Input features CSV (default: features_data.csv)')
     parser.add_argument('--model',   default='model.tflite',
                         help='TFLite model file (default: model.tflite)')
-    parser.add_argument('--labels',  default='model_labels.npy',
-                        help='Label mapping from train.py (default: model_labels.npy)')
+    parser.add_argument('--labels',  default='model_labels.txt',
+                        help='Label mapping from train.py (default: model_labels.txt)')
     parser.add_argument('--out',     default='results.csv',
                         help='Output results CSV (default: results.csv)')
     parser.add_argument('-e', '--ext_delegate',
@@ -88,8 +88,9 @@ def main():
         args.model, args.ext_delegate, delegate_opts, args.num_threads)
     print(f'Model loaded from {args.model}')
 
-    le_classes = np.load(args.labels, allow_pickle=True)
-    print(f'Classes: {list(le_classes)}\n')
+    with open(args.labels) as f:
+        le_classes = [l.strip() for l in f if l.strip()]
+    print(f'Classes: {le_classes}\n')
 
     df = pd.read_csv(args.data)
     print(f'Loaded {len(df)} samples from {args.data}\n')

@@ -142,8 +142,8 @@ def main():
                         help=f'RPMsg tty device (default: {RPMSG_DEVICE})')
     parser.add_argument('--model',  default='../ml/model.tflite',
                         help='TFLite model path (default: ../ml/model.tflite)')
-    parser.add_argument('--labels', default='../ml/model_labels.npy',
-                        help='Label mapping from train.py (default: ../ml/model_labels.npy)')
+    parser.add_argument('--labels', default='../ml/model_labels.txt',
+                        help='Label class file from train.py (default: ../ml/model_labels.txt)')
     parser.add_argument('-e', '--ext_delegate',
                         help='External delegate library (e.g. /usr/lib/libvx_delegate.so)')
     parser.add_argument('-o', '--ext_delegate_options',
@@ -165,8 +165,9 @@ def main():
 
     interpreter, input_details, output_details = load_interpreter(
         args.model, args.ext_delegate, delegate_opts, args.num_threads)
-    le_classes = np.load(args.labels, allow_pickle=True)
-    print(f'Model ready. Classes: {list(le_classes)}')
+    with open(args.labels) as f:
+        le_classes = [l.strip() for l in f if l.strip()]
+    print(f'Model ready. Classes: {le_classes}')
 
     proc = psutil.Process()
     proc.cpu_percent(interval=None)   # prime the counter
