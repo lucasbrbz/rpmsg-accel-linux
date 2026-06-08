@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-Experiment A — Linux-only baseline.
+Experiment A — Linux CPU baseline (Jetson simulation).
 
 Receives raw FRAME_RAW_ACCEL samples from the M7, accumulates them into
-windows of WINDOW_SIZE, computes features on the A53, and writes
-features_data.csv in the same format as exp-b for direct model comparison.
+windows of WINDOW_SIZE, computes features on the A53 CPU, runs TFLite
+inference on CPU, and writes features_data.csv.
 
 Usage:
-    python3 accel_receiver.py [--device /dev/ttyRPMSG0]
+    python3 accel_receiver.py --model ../ml/model.tflite
 """
 
+import argparse
 import csv
 import math
 import os
 import signal
 import struct
 import sys
-import argparse
 import termios
 import time
 import tty
+
+import numpy as np
+import tflite_runtime.interpreter as tflite
 
 RPMSG_DEVICE  = '/dev/ttyRPMSG0'
 FRAME_MAGIC   = 0xA55AA55A
@@ -37,7 +40,7 @@ RAW_ACCEL_PAYLOAD_SIZE   = struct.calcsize(RAW_ACCEL_PAYLOAD_FORMAT)  # 6 bytes
 
 FRAME_RAW_ACCEL = 1
 
-CSV_HEADER = ['seq', 't_ms', 'recv_ms', 'label',
+CSV_HEADER = ['seq', 't_ms', 'recv_ms', 'label', 'prediction',
               'rms_x',  'rms_y',  'rms_z',
               'peak_x', 'peak_y', 'peak_z',
               'std_x',  'std_y',  'std_z',
@@ -91,22 +94,18 @@ def read_frame(fd):
 
 
 def compute_features(window):
-    """Compute RMS, peak, std dev, peak-to-peak per axis over the sample window.
-    window: list of (x, y, z) tuples (int16 raw values).
-    Returns a flat tuple: (rms_x..z, peak_x..z, std_x..z, p2p_x..z)."""
-    n   = len(window)
-    xs  = [s[0] for s in window]
-    ys  = [s[1] for s in window]
-    zs  = [s[2] for s in window]
+    """Compute RMS, peak, std dev, peak-to-peak per axis over the sample window."""
+    xs = [s[0] for s in window]
+    ys = [s[1] for s in window]
+    zs = [s[2] for s in window]
 
     def stats(vals):
-        n      = len(vals)
-        mean   = sum(vals) / n
-        rms    = math.sqrt(sum(v * v for v in vals) / n)
-        peak   = max(abs(v) for v in vals)
-        var    = sum((v - mean) ** 2 for v in vals) / n
-        std    = math.sqrt(var)
-        p2p    = max(vals) - min(vals)
+        n    = len(vals)
+        mean = sum(vals) / n
+        rms  = math.sqrt(sum(v * v for v in vals) / n)
+        peak = max(abs(v) for v in vals)
+        std  = math.sqrt(sum((v - mean) ** 2 for v in vals) / n)
+        p2p  = max(vals) - min(vals)
         return rms, peak, std, p2p
 
     rx, px, sx, ppx = stats(xs)
@@ -116,17 +115,51 @@ def compute_features(window):
     return rx, ry, rz, px, py, pz, sx, sy, sz, ppx, ppy, ppz
 
 
+def load_interpreter(model_path, num_threads=None):
+    interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
+    interpreter.allocate_tensors()
+
+    input_details  = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    # Warm-up invoke
+    dummy = np.zeros((1, 12), dtype=np.float32)
+    interpreter.set_tensor(input_details[0]['index'], dummy)
+    interpreter.invoke()
+
+    return interpreter, input_details, output_details
+
+
+def predict(interpreter, input_details, output_details, le_classes, features):
+    x = np.array(features, dtype=np.float32).reshape(1, -1)
+    interpreter.set_tensor(input_details[0]['index'], x)
+    interpreter.invoke()
+    out = interpreter.get_tensor(output_details[0]['index'])
+    return le_classes[int(np.argmax(np.squeeze(out)))]
+
+
 def main():
     global fd, csv_file
 
-    parser = argparse.ArgumentParser(description='RPMsg raw accel receiver — exp-a')
+    parser = argparse.ArgumentParser(description='RPMsg raw accel receiver — exp-a (CPU inference)')
     parser.add_argument('--device', default=RPMSG_DEVICE,
                         help=f'RPMsg tty device (default: {RPMSG_DEVICE})')
+    parser.add_argument('--model',  default='../ml/model.tflite',
+                        help='TFLite model path (default: ../ml/model.tflite)')
+    parser.add_argument('--labels', default='../ml/model_labels.npy',
+                        help='Label mapping from train.py (default: ../ml/model_labels.npy)')
+    parser.add_argument('--num_threads', type=int, default=None,
+                        help='Number of CPU threads for inference')
     args = parser.parse_args()
 
     sys.stdout.reconfigure(line_buffering=True)
     signal.signal(signal.SIGINT,  cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+
+    interpreter, input_details, output_details = load_interpreter(
+        args.model, args.num_threads)
+    le_classes = np.load(args.labels, allow_pickle=True)
+    print(f'Model ready (CPU). Classes: {list(le_classes)}')
 
     csv_path = 'features_data.csv'
     csv_file = open(csv_path, 'w', newline='')
@@ -140,15 +173,15 @@ def main():
     termios.tcflush(fd, termios.TCIFLUSH)
 
     os.write(fd, b'\x00')
-    print(f'Handshake sent. Waiting for data...\n')
-    print(f'{"seq":>8}  {"t_ms":>9}  {"label":<12}  {"x":>7}  {"y":>7}  {"z":>7}')
-    print('-' * 64)
+    print('Handshake sent. Waiting for data...\n')
+    print(f'{"seq":>8}  {"t_ms":>9}  {"label":<12}  {"pred":<12}  {"x":>7}  {"y":>7}  {"z":>7}')
+    print('-' * 80)
 
-    sample_buf  = []   # accumulates (x, y, z) tuples
-    window_seq  = 0    # feature frame counter
-    window_t_ms = 0    # t_ms of the first sample in the current window
-    window_recv = 0.0  # recv_ms of the first sample in the current window
-    window_label = ''  # label of the last sample in the window
+    sample_buf   = []
+    window_seq   = 0
+    window_t_ms  = 0
+    window_recv  = 0.0
+    window_label = ''
 
     while True:
         (magic, version, ftype, seq, ts_ms, label, flags, payload_len), payload_raw, skipped = \
@@ -167,7 +200,7 @@ def main():
         x, y, z   = struct.unpack(RAW_ACCEL_PAYLOAD_FORMAT, payload_raw)
         label_str = LABELS.get(label, f'UNKNOWN({label})')
 
-        print(f'{seq:>8}  {ts_ms:>9}  {label_str:<12}  {x:>7}  {y:>7}  {z:>7}')
+        print(f'{seq:>8}  {ts_ms:>9}  {label_str:<12}  {"...":>12}  {x:>7}  {y:>7}  {z:>7}')
 
         if len(sample_buf) == 0:
             window_t_ms  = ts_ms
@@ -183,14 +216,19 @@ def main():
             std_x,  std_y,  std_z, \
             p2p_x,  p2p_y,  p2p_z  = feats
 
-            writer.writerow([window_seq, window_t_ms, f'{window_recv:.3f}', window_label,
+            prediction = predict(interpreter, input_details, output_details,
+                                 le_classes, list(feats))
+            match = 'OK' if prediction == window_label else 'MISMATCH'
+
+            writer.writerow([window_seq, window_t_ms, f'{window_recv:.3f}',
+                             window_label, prediction,
                              f'{rms_x:.3f}',  f'{rms_y:.3f}',  f'{rms_z:.3f}',
                              f'{peak_x:.3f}', f'{peak_y:.3f}', f'{peak_z:.3f}',
                              f'{std_x:.3f}',  f'{std_y:.3f}',  f'{std_z:.3f}',
                              f'{p2p_x:.3f}',  f'{p2p_y:.3f}',  f'{p2p_z:.3f}'])
             csv_file.flush()
 
-            print(f'  >> window {window_seq}  [{window_label}]  '
+            print(f'  >> window {window_seq}  [{window_label}] → {prediction}  [{match}]  '
                   f'rms_x={rms_x:.1f}  p2p_x={p2p_x:.1f}')
 
             sample_buf  = []
