@@ -5,7 +5,6 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <math.h>
 #include "board.h"
 #include "fsl_debug_console.h"
 #include "FreeRTOS.h"
@@ -25,7 +24,6 @@
 #define NORMAL_SAMPLES       40U
 #define IMBALANCE_SAMPLES    40U
 #define ANOMALY_SAMPLES      20U
-#define FEATURE_WINDOW_SIZE  20U   /* samples accumulated before computing and sending one feature frame */
 
 typedef enum { STATE_NORMAL = 0, STATE_IMBALANCE, STATE_ANOMALY } accel_state_t;
 
@@ -56,22 +54,11 @@ typedef struct __attribute__((packed))
 
 typedef struct __attribute__((packed)) { int16_t x; int16_t y; int16_t z; } raw_accel_payload_t;
 
-/* Features payload: RMS, peak (max |x|), std dev, peak-to-peak — per axis (x, y, z) */
-typedef struct __attribute__((packed))
-{
-    float    rms_x,  rms_y,  rms_z;
-    float    peak_x, peak_y, peak_z;
-    float    std_x,  std_y,  std_z;
-    float    p2p_x,  p2p_y,  p2p_z;
-    uint16_t window_size;
-    uint16_t reserved;
-} features_payload_t;
-
 typedef struct __attribute__((packed))
 {
     rpmsg_frame_header_t hdr;
-    features_payload_t   payload;
-} features_frame_t;
+    raw_accel_payload_t  payload;
+} raw_accel_frame_t;
 
 /*******************************************************************************
  * Simulation helpers
@@ -111,66 +98,6 @@ static raw_accel_payload_t make_sample(accel_state_t state)
 }
 
 /*******************************************************************************
- * Feature computation — single pass over the window buffer
- ******************************************************************************/
-static features_payload_t compute_features(const raw_accel_payload_t *buf, uint32_t n)
-{
-    features_payload_t f;
-    float sum_x  = 0.0f, sum_y  = 0.0f, sum_z  = 0.0f;
-    float sum_x2 = 0.0f, sum_y2 = 0.0f, sum_z2 = 0.0f;
-    float min_x, max_x, min_y, max_y, min_z, max_z;
-
-    min_x = max_x = (float)buf[0].x;
-    min_y = max_y = (float)buf[0].y;
-    min_z = max_z = (float)buf[0].z;
-
-    for (uint32_t i = 0U; i < n; i++)
-    {
-        float x = (float)buf[i].x;
-        float y = (float)buf[i].y;
-        float z = (float)buf[i].z;
-
-        sum_x  += x;       sum_y  += y;       sum_z  += z;
-        sum_x2 += x * x;   sum_y2 += y * y;   sum_z2 += z * z;
-
-        if (x < min_x) min_x = x;
-        if (x > max_x) max_x = x;
-        if (y < min_y) min_y = y;
-        if (y > max_y) max_y = y;
-        if (z < min_z) min_z = z;
-        if (z > max_z) max_z = z;
-    }
-
-    float fn     = (float)n;
-    float mean_x = sum_x / fn;
-    float mean_y = sum_y / fn;
-    float mean_z = sum_z / fn;
-
-    f.rms_x  = sqrtf(sum_x2 / fn);
-    f.rms_y  = sqrtf(sum_y2 / fn);
-    f.rms_z  = sqrtf(sum_z2 / fn);
-
-    /* peak = max absolute value */
-    f.peak_x = (max_x > -min_x) ? max_x : -min_x;
-    f.peak_y = (max_y > -min_y) ? max_y : -min_y;
-    f.peak_z = (max_z > -min_z) ? max_z : -min_z;
-
-    /* population std dev: sqrt(E[x²] - E[x]²) — avoids a second pass */
-    f.std_x = sqrtf(sum_x2 / fn - mean_x * mean_x);
-    f.std_y = sqrtf(sum_y2 / fn - mean_y * mean_y);
-    f.std_z = sqrtf(sum_z2 / fn - mean_z * mean_z);
-
-    f.p2p_x = max_x - min_x;
-    f.p2p_y = max_y - min_y;
-    f.p2p_z = max_z - min_z;
-
-    f.window_size = (uint16_t)n;
-    f.reserved    = 0U;
-
-    return f;
-}
-
-/*******************************************************************************
  * Main task
  ******************************************************************************/
 static void accel_task(void *param)
@@ -181,9 +108,7 @@ static void accel_task(void *param)
                                            NORMAL_SAMPLES, ANOMALY_SAMPLES};
     static const char         *names[]  = {"NORMAL", "IMBALANCE", "ANOMALY"};
 
-    PRINTF("\r\nRPMsg accel feature extractor (M7 -> A53)\r\n");
-    PRINTF("Window: %u samples, frame: %u bytes\r\n",
-           FEATURE_WINDOW_SIZE, (uint32_t)sizeof(features_frame_t));
+    PRINTF("\r\nRPMsg accel simulator (M7 -> A53)\r\n");
     PRINTF("Shared mem base: 0x%x\r\n", RPMSG_LITE_SHMEM_BASE);
 
     PRINTF("Calling rpmsg_lite_remote_init...\r\n");
@@ -198,6 +123,9 @@ static void accel_task(void *param)
     }
 
     PRINTF("Waiting for Linux link up...\r\n");
+    PRINTF("  link_state addr=0x%08X initial=%u\r\n",
+           (uint32_t)&rpmsg->link_state,
+           *(volatile uint32_t *)&rpmsg->link_state);
     {
         uint32_t poll = 0U;
         while (*(volatile uint32_t *)&rpmsg->link_state == 0U)
@@ -232,49 +160,33 @@ static void accel_task(void *param)
     char              handshake[4];
     rpmsg_queue_recv(rpmsg, queue, (uint32_t *)&remote_addr,
                      handshake, sizeof(handshake), NULL, RL_BLOCK);
-    PRINTF("A53 connected at addr %u. Computing features every %u samples...\r\n",
-           remote_addr, FEATURE_WINDOW_SIZE);
+    PRINTF("A53 connected at addr %u. Streaming...\r\n", remote_addr);
 
-    uint32_t            seq_idx     = 0U;
-    uint32_t            state_count = 0U;
-    uint32_t            frame_seq   = 0U;
-    raw_accel_payload_t s_window[FEATURE_WINDOW_SIZE];
-    uint32_t            win_idx = 0U;
-
+    uint32_t seq_idx     = 0U;
+    uint32_t state_count = 0U;
+    uint32_t frame_seq   = 0U;
     PRINTF("[%s]\r\n", names[seq[seq_idx]]);
 
     while (1)
     {
         accel_state_t       state = seq[seq_idx];
         raw_accel_payload_t s     = make_sample(state);
+        raw_accel_frame_t   frame;
 
-        s_window[win_idx++] = s;
+        frame.hdr.magic       = FRAME_MAGIC;
+        frame.hdr.version     = FRAME_VERSION;
+        frame.hdr.type        = (uint8_t)FRAME_RAW_ACCEL;
+        frame.hdr.seq         = frame_seq++;
+        frame.hdr.timestamp_ms = (uint32_t)((uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
+        frame.hdr.label       = (uint8_t)((uint8_t)state + 1U); /* maps to label_t values 1–3 */
+        frame.hdr.flags       = 0x01U;                           /* bit0: mocked */
+        frame.hdr.payload_len = (uint16_t)sizeof(raw_accel_payload_t);
+        frame.payload         = s;
 
-        if (win_idx >= FEATURE_WINDOW_SIZE)
-        {
-            win_idx = 0U;
-
-            features_payload_t feat  = compute_features(s_window, FEATURE_WINDOW_SIZE);
-            features_frame_t   frame;
-
-            frame.hdr.magic        = FRAME_MAGIC;
-            frame.hdr.version      = FRAME_VERSION;
-            frame.hdr.type         = (uint8_t)FRAME_FEATURES;
-            frame.hdr.seq          = frame_seq++;
-            frame.hdr.timestamp_ms = (uint32_t)((uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
-            frame.hdr.label        = (uint8_t)((uint8_t)state + 1U);
-            frame.hdr.flags        = 0x01U;
-            frame.hdr.payload_len  = (uint16_t)sizeof(features_payload_t);
-            frame.payload          = feat;
-
-            PRINTF("[%s] seq=%u rms_x=%.1f peak_x=%.1f std_x=%.1f p2p_x=%.1f\r\n",
-                   names[state], frame.hdr.seq,
-                   (double)feat.rms_x, (double)feat.peak_x,
-                   (double)feat.std_x, (double)feat.p2p_x);
-
-            (void)rpmsg_lite_send(rpmsg, ept, (uint32_t)remote_addr,
-                                  (char *)&frame, sizeof(frame), RL_BLOCK);
-        }
+        PRINTF("[%s] seq=%u x=%6d y=%6d z=%6d\r\n",
+               names[state], frame.hdr.seq, s.x, s.y, s.z);
+        (void)rpmsg_lite_send(rpmsg, ept, (uint32_t)remote_addr,
+                              (char *)&frame, sizeof(frame), RL_BLOCK);
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
 
